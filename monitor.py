@@ -313,16 +313,18 @@ def fetch_and_sync_data():
     as300_c, as300_v = safe_get_yf("510300.SS", "AS300", return_vol=True)
     chinext_c, chinext_v = safe_get_yf("159915.SZ", "ChiNext", return_vol=True)
 
-    # 盘中成交量动态时间折算：防止盘中半截成交量导致顶部两市成交额与本土活水总分误降 9 分
+    # 盘中成交量动态时间折算：先转为 float64 浮点型，防止 Pandas int64 报错
     if not as300_v.empty:
+        as300_v = as300_v.astype(float)
         mult_a, is_ext_a = get_intraday_multiplier(as300_v.index[-1], is_cn_market=True)
         if is_ext_a:
-            as300_v.iloc[-1] = as300_v.iloc[-1] * mult_a
+            as300_v.iloc[-1] = float(as300_v.iloc[-1]) * mult_a
     if not chinext_v.empty:
+        chinext_v = chinext_v.astype(float)
         mult_c, is_ext_c = get_intraday_multiplier(chinext_v.index[-1], is_cn_market=True)
         if is_ext_c:
-            chinext_v.iloc[-1] = chinext_v.iloc[-1] * mult_c
-
+            chinext_v.iloc[-1] = float(chinext_v.iloc[-1]) * mult_c
+    
     yf_dict = {
         'dxy': safe_get_yf("DX-Y.NYB", "DXY"),
         'copper': safe_get_yf("HG=F", "Copper"),
