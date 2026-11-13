@@ -10,7 +10,7 @@ import akshare as ak
 # ==============================================================================
 # 1. 界面配置与视觉主题
 # ==============================================================================
-st.set_page_config(page_title="GSMI v2.1 | 全球宏观与本土行业", layout="wide")
+st.set_page_config(page_title="GSMI v2.2 | 全球宏观与本土行业", layout="wide")
 
 st.markdown("""
     <style>
@@ -25,18 +25,18 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-st.title("🏹 GSMI Dual-Core v2.1 | 全球宏观与本土行业")
+st.title("🏹 GSMI Dual-Core v2.2 | 全球宏观与本土行业")
 
 status_placeholder = st.empty()
 
 # ==============================================================================
-# 2. 侧边栏参数配置 (支持 0.0 全自动每日动态测算)
+# 2. 侧边栏参数配置 (支持 0.0 全自动盘中动态折算)
 # ==============================================================================
 st.sidebar.header("🛠️ 本土与全球双核参数")
 cn_turnover_manual = st.sidebar.number_input(
     "🌊 A股两市成交额 (万亿¥, 0为全自动每日测算)", 
     min_value=0.0, max_value=5.0, value=0.0, step=0.05,
-    help="保持 0.00 即可！系统每天会自动抓取或根据核心宽基实时量能动态推算当日两市成交额；你也可以手动输入特定数值进行沙盘推演。"
+    help="保持 0.00 即可！系统会自动抓取或根据核心宽基实时量能（含盘中分钟折算）动态推算当日两市全天预计成交额。"
 )
 cn_10y_bond = st.sidebar.number_input(
     "🏛️ 中国 10Y 国债收益率 (%)", 
@@ -62,32 +62,45 @@ if not fred_key:
 fred = Fred(api_key=fred_key)
 
 # ==============================================================================
-# 3. 核心物理函数：盘中时间折算 VR 与三重装甲数据引擎
+# 3. 核心物理函数：盘中时钟折算、3日冷却记忆锁与三重装甲引擎
 # ==============================================================================
+# 核心行业 ETF 对应的第一权重龙头映射字典 (用于 Tab 3 龙头扳机实时验证)
+LEADER_MAP = {
+    "159566.SZ": ("300274.SZ", "阳光电源"),
+    "159796.SZ": ("300750.SZ", "宁德时代"),
+    "159326.SZ": ("002028.SZ", "思源电气"),
+    "159558.SZ": ("002371.SZ", "北方华创"),
+    "159516.SZ": ("002371.SZ", "北方华创"),
+    "515880.SS": ("300308.SZ", "中际旭创"),
+    "516620.SS": ("300251.SZ", "光线传媒"),
+    "159855.SZ": ("300251.SZ", "光线传媒"),
+    "512980.SS": ("002027.SZ", "分众传媒"),
+    "159870.SZ": ("600309.SS", "万华化学"),
+    "512070.SS": ("601318.SS", "中国平安"),
+    "512880.SS": ("600030.SH", "中信证券"),
+    "516310.SS": ("601288.SS", "农业银行"),
+    "512800.SS": ("600036.SS", "招商银行"),
+    "512890.SS": ("601009.SS", "南京银行"),
+    "512010.SS": ("603259.SS", "药明康德"),
+    "159992.SZ": ("600276.SS", "恒瑞医药"),
+    "512690.SS": ("600519.SS", "贵州茅台"),
+    "512400.SS": ("601899.SS", "紫金矿业"),
+    "515220.SS": ("601088.SS", "中国神华"),
+    "159732.SZ": ("002475.SZ", "立讯精密")
+}
+
 def get_beijing_now():
     """获取当前精确北京时间 (UTC+8)"""
     return datetime.now(timezone.utc) + timedelta(hours=8)
 
-def calc_smart_vr(vol_series, is_cn_market=True):
+def get_intraday_multiplier(last_bar_date_obj, is_cn_market=True):
     """
-    智能量能倍率 (VR) 计算器：
-    若当前处于 A 股盘中交易时段 (北京时间 09:30 - 15:00) 且最新数据为今日残缺成交量，
-    自动按已开盘分钟数折算为全天预计成交量，彻底消除盘中 VR 变成 0.1~0.3 的伪缩量失真。
+    计算 A 股盘中交易时段 (09:30 - 15:00) 的全天成交量折算系数。
+    同时用于个股/ETF 的智能 VR 以及顶部宏观两市总成交额的盘中校准。
     """
-    if len(vol_series) < 6:
-        return 1.0, False
-    avg_5d = vol_series.iloc[-6:-1].mean()
-    if avg_5d <= 0:
-        return 1.0, False
-
-    raw_last_vol = float(vol_series.iloc[-1])
     bj_now = get_beijing_now()
-    last_bar_date = pd.to_datetime(vol_series.index[-1]).date()
-
-    is_intraday_extrapolated = False
-    proj_vol = raw_last_vol
-
-    if is_cn_market and last_bar_date == bj_now.date() and bj_now.weekday() < 5:
+    last_date = pd.to_datetime(last_bar_date_obj).date()
+    if is_cn_market and last_date == bj_now.date() and bj_now.weekday() < 5:
         cur_mins = bj_now.hour * 60 + bj_now.minute
         open_mins = 9 * 60 + 30    # 09:30
         lunch_start = 11 * 60 + 30 # 11:30
@@ -101,19 +114,78 @@ def calc_smart_vr(vol_series, is_cn_market=True):
                 elapsed = 120.0
             else:
                 elapsed = 120.0 + (cur_mins - lunch_end)
-            # 防止开盘前15分钟过度放大，设定最小折算基数为 20 分钟
             eff_elapsed = max(float(elapsed), 20.0)
-            proj_vol = raw_last_vol * (240.0 / eff_elapsed)
-            is_intraday_extrapolated = True
+            return 240.0 / eff_elapsed, True
+    return 1.0, False
 
-    vr_val = proj_vol / (avg_5d + 1e-9)
-    return vr_val, is_intraday_extrapolated
+def calc_smart_vr(vol_series, is_cn_market=True):
+    """
+    智能量能倍率 (VR) 计算器：
+    采用过去5日均量与中位数的稳健均值作为分母（防止前一日单日天量过度压低次日VR），并支持盘中动态折算。
+    """
+    if len(vol_series) < 6:
+        return 1.0, False
+    prev_5_vols = vol_series.iloc[-6:-1]
+    base_vol = 0.5 * prev_5_vols.mean() + 0.5 * prev_5_vols.median()
+    if base_vol <= 0:
+        return 1.0, False
+
+    mult, is_extrap = get_intraday_multiplier(vol_series.index[-1], is_cn_market=is_cn_market)
+    proj_vol = float(vol_series.iloc[-1]) * mult
+    vr_val = proj_vol / (base_vol + 1e-9)
+    return vr_val, is_extrap
+
+def is_bar_distribution(close_p, prev_close_p, high_p, low_p, vr_val):
+    """
+    判定单根 K 线是否构成【真实的放量长上影/阴线出逃】：
+    增加物理绝对幅度门槛：上影线真实回落幅度必须 > 1.2% 且全天振幅 > 1.5%（或单日实跌 < -1.5%），
+    彻底消除银行等低波资产全天仅波动 0.4% (几厘钱) 被显微镜放大误报为长上影出逃的问题。
+    """
+    ret_1d = (close_p / (prev_close_p + 1e-9)) - 1.0
+    c_range = max(high_p - low_p, 1e-6)
+    c_pos = (close_p - low_p) / c_range
+    upper_shadow_pct = (high_p - close_p) / (close_p + 1e-9)
+    day_amp_pct = (high_p - low_p) / (low_p + 1e-9)
+
+    is_real_long_shadow = (c_pos < 0.35) and (upper_shadow_pct > 0.012) and (day_amp_pct > 0.015)
+    is_real_big_drop = (ret_1d < -0.015)
+
+    return (vr_val > 1.38) and (is_real_big_drop or is_real_long_shadow)
+
+def check_cooldown_lock(close_s, high_s, low_s, vol_s, is_cn_market=True, lookback=3):
+    """
+    3日出逃冷却记忆锁 (Cooldown Lock)：
+    检查过去 lookback (3) 个交易日内是否发生过真实的放量派发/出逃 K 线，
+    若发生过，且当前最新价尚未向上突破那根出逃 K 线的最高价 (未完成反包确认)，则触发冷却锁！
+    """
+    n = len(close_s)
+    if n < 10:
+        return False
+    # 检查今日 (-1) 以及前两日 (-2, -3)
+    for offset in range(1, lookback + 1):
+        idx = n - offset
+        c_p = float(close_s.iloc[idx])
+        prev_c = float(close_s.iloc[idx - 1])
+        h_p = float(high_s.iloc[idx])
+        l_p = float(low_s.iloc[idx])
+
+        prev_5_v = vol_s.iloc[idx - 5:idx]
+        b_vol = 0.5 * prev_5_v.mean() + 0.5 * prev_5_v.median()
+        if idx == n - 1:
+            mult, _ = get_intraday_multiplier(vol_s.index[idx], is_cn_market=is_cn_market)
+            v_bar = float(vol_s.iloc[idx]) * mult / (b_vol + 1e-9)
+        else:
+            v_bar = float(vol_s.iloc[idx]) / (b_vol + 1e-9)
+
+        if is_bar_distribution(c_p, prev_c, h_p, l_p, v_bar):
+            # 如果是过去2天发生的出逃，且当前最新价仍低于出逃日最高价，则处于冷却锁定期
+            if offset > 1 and float(close_s.iloc[-1]) < h_p:
+                return True
+    return False
 
 @st.cache_data(ttl=900)
 def get_etf_data_v2(ticker, start_date, end_date):
-    """
-    三重装甲 ETF/个股前复权抓取引擎
-    """
+    """三重装甲 ETF/个股前复权抓取引擎"""
     if ".SS" in ticker or ".SZ" in ticker or ".SH" in ticker:
         try:
             symbol = ticker.split('.')[0]
@@ -186,7 +258,7 @@ def get_tga_forecast(curr_tga_billion, target_val):
     gap = target_val - curr_tga_billion
     return msg, gap, risk
 
-@st.cache_data(ttl=1800)
+@st.cache_data(ttl=1200)
 def fetch_and_sync_data():
     end = datetime.now()
     start = end - timedelta(days=500)
@@ -241,6 +313,16 @@ def fetch_and_sync_data():
     as300_c, as300_v = safe_get_yf("510300.SS", "AS300", return_vol=True)
     chinext_c, chinext_v = safe_get_yf("159915.SZ", "ChiNext", return_vol=True)
 
+    # 盘中成交量动态时间折算：防止盘中半截成交量导致顶部两市成交额与本土活水总分误降 9 分
+    if not as300_v.empty:
+        mult_a, is_ext_a = get_intraday_multiplier(as300_v.index[-1], is_cn_market=True)
+        if is_ext_a:
+            as300_v.iloc[-1] = as300_v.iloc[-1] * mult_a
+    if not chinext_v.empty:
+        mult_c, is_ext_c = get_intraday_multiplier(chinext_v.index[-1], is_cn_market=True)
+        if is_ext_c:
+            chinext_v.iloc[-1] = chinext_v.iloc[-1] * mult_c
+
     yf_dict = {
         'dxy': safe_get_yf("DX-Y.NYB", "DXY"),
         'copper': safe_get_yf("HG=F", "Copper"),
@@ -259,7 +341,6 @@ def fetch_and_sync_data():
         'vix': safe_get_yf("^VIX", "VIX")
     }
 
-    # 尝试直接通过 AkShare 获取上证+深成指真实历史成交额 (万亿元)
     cn_real_amt = pd.Series(dtype='float64')
     try:
         sh_idx = ak.stock_zh_index_daily_em(symbol="sh000001")
@@ -268,6 +349,10 @@ def fetch_and_sync_data():
             sh_s = pd.Series(pd.to_numeric(sh_idx['amount'], errors='coerce').values, index=pd.to_datetime(sh_idx['date']))
             sz_s = pd.Series(pd.to_numeric(sz_idx['amount'], errors='coerce').values, index=pd.to_datetime(sz_idx['date']))
             cn_real_amt = ((sh_s + sz_s) / 1e12).sort_index()
+            if not cn_real_amt.empty:
+                m_idx, is_ext_idx = get_intraday_multiplier(cn_real_amt.index[-1], is_cn_market=True)
+                if is_ext_idx:
+                    cn_real_amt.iloc[-1] = cn_real_amt.iloc[-1] * m_idx
             status_report["CN_Turnover"] = "✅(Real)"
     except Exception:
         status_report["CN_Turnover"] = "⚠️(Proxy)"
@@ -296,24 +381,19 @@ def fetch_and_sync_data():
         if 'us10y' in df.columns and 'us2y' in df.columns:
             df['yield_curve'] = df['us10y'] - df['us2y']
 
-        # 构建每日动态变化的 A股两市成交额序列 (若无真实东财序列，则用 510300+159915 动态量比拟合)
         vol_proxy_ratio = (
-            (df['as300_vol'] / (df['as300_vol'].rolling(20).mean() + 1e-9)) * 0.6 +
-            (df['chinext_vol'] / (df['chinext_vol'].rolling(20).mean() + 1e-9)) * 0.4
-        ).clip(0.5, 2.2).fillna(1.0)
+            (df['as300_vol'] / (df['as300_vol'].rolling(20).median() + 1e-9)) * 0.6 +
+            (df['chinext_vol'] / (df['chinext_vol'].rolling(20).median() + 1e-9)) * 0.4
+        ).clip(0.65, 2.2).fillna(1.0)
 
         if 'cn_amt_real' in df.columns and df['cn_amt_real'].notna().sum() > 10:
-            df['cn_turnover_series'] = df['cn_amt_real'].ffill().fillna(1.55 * vol_proxy_ratio)
+            df['cn_turnover_series'] = df['cn_amt_real'].ffill().fillna(1.58 * vol_proxy_ratio)
         else:
-            df['cn_turnover_series'] = (1.55 * vol_proxy_ratio).round(2)
+            df['cn_turnover_series'] = (1.58 * vol_proxy_ratio).round(2)
 
     return df, status_report
 
 def calculate_dual_scores(df, fms_val, cn_turnover_input, cn_bond):
-    """
-    全动态双核计分引擎：
-    彻底消除静态常数，让全球 GSMI 与 本土 CN-Water 总分每天随量价、汇率、利差连续跳动！
-    """
     if df.empty:
         return df, 50.0, 1.55, {}
     if 'spread' in df.columns and df['spread'].max() < 50:
@@ -342,29 +422,25 @@ def calculate_dual_scores(df, fms_val, cn_turnover_input, cn_bond):
         s_spread = score_linear(df['spread'].iloc[i], 300, 600, 10, reverse=True)
         gsmi_history.append(s_nl + s_tips + s_dxy + s_fms + s_cg + s_spread)
 
-        # 2. 中国本土活水评分 (CN-Water Score: 100% 连续动态函数，每天随行情变化)
+        # 2. 中国本土活水评分 (含盘中折算量能保护)
         day_to = df['cn_turnover_series'].iloc[i]
         if i == len(df) - 1 and cn_turnover_input > 0:
             day_to = cn_turnover_input
 
-        # (a) 两市量能水位 (35分)：成交额线性分(25分) + 核心宽基5日量比动量(10分)
         s_vol_abs = score_linear(day_to, 1.0, 2.1, 25, reverse=False)
-        v_ratio_5d = df['as300_vol'].iloc[i-4:i+1].mean() / (df['as300_vol'].iloc[i-19:i+1].mean() + 1e-9)
+        v_ratio_5d = df['as300_vol'].iloc[i-4:i+1].mean() / (df['as300_vol'].iloc[i-19:i+1].median() + 1e-9)
         s_vol_mom = score_linear(v_ratio_5d, 0.7, 1.35, 10, reverse=False)
         s_cn_vol = s_vol_abs + s_vol_mom
 
-        # (b) 本土大盘趋势与风险偏好 (30分)：沪深300偏离20MA线性分(15分) + 创业板10日动量线性分(15分)
         as300_bias20 = (df['as300'].iloc[i] / (as300_ma20.iloc[i] + 1e-9)) - 1
         chinext_mom10 = (df['chinext'].iloc[i] / (df['chinext'].iloc[i-10] + 1e-9)) - 1
         s_cn_trend = score_linear(as300_bias20, -0.05, 0.05, 15, reverse=False) + score_linear(chinext_mom10, -0.08, 0.08, 15, reverse=False)
 
-        # (c) 本土动态股债利差 ERP 与红利底盘 (20分)
         div_price_ratio = (div_ma60.iloc[i] / (df['div_low'].iloc[i] + 1e-9)) if not pd.isna(div_ma60.iloc[i]) else 1.0
         dyn_div_yield = 4.66 * np.clip(div_price_ratio, 0.85, 1.15)
         erp_val = dyn_div_yield - cn_bond
         s_cn_erp = score_linear(erp_val, 1.6, 3.3, 20, reverse=False)
 
-        # (d) 人民币汇率结汇压差与港股联动 (15分)
         cny_chg10 = (df['cny'].iloc[i] / (df['cny'].iloc[i-10] + 1e-9)) - 1
         s_cny = score_linear(cny_chg10, -0.015, 0.015, 9, reverse=True)
         s_hkd = score_linear(df['hkd'].iloc[i], 7.76, 7.85, 6, reverse=True)
@@ -407,19 +483,19 @@ try:
 
     if sofr_val > 5.0 or vix_val > 32.0:
         banner_icon, banner_zone = "🚨", "海外流动性休克警报 (跨洋提款风险)"
-        banner_action = f"SOFR息差({sofr_val:+.1f}bps)或VIX({vix_val:.1f})触发极值！严防外资抛售A股核心资产换汇，暂停右侧追高，收缩至红利与现金防线。"
+        banner_action = f"SOFR息差({sofr_val:+.1f}bps)或VIX({vix_val:.1f})触发极值！严防外资抛售A股核心资产换汇，暂停右侧追高，收缩至现金与低波防线。"
         border_col = "#FF3131"
     elif cn_score >= 65:
         banner_icon, banner_zone = "🟢", "本土活水扩张区 (内生做多窗口)"
-        banner_action = f"A股量能({eff_turnover:.2f}万亿)与动量充沛，本土总分({cn_score:.1f})走强！优先围绕『🎯水上回踩10MA』与硬核制造主线积极吸气。"
+        banner_action = f"A股预计量能({eff_turnover:.2f}万亿)与动量充沛，本土总分({cn_score:.1f})走强！优先围绕『🎯水上回踩10MA』与硬核制造主线积极吸气。"
         border_col = "#00ffcc"
     elif cn_score >= 45:
-        banner_icon, banner_zone = "🟡", "结构性存量博弈区 (三三制均衡防守反击)"
-        banner_action = f"本土总分({cn_score:.1f}，较前日{cn_score_delta:+.1f})处于存量轮动，全球GSMI({us_gsmi:.1f})。严禁在偏离10MA >6%时追高，严守【1/3进攻+1/3金融红利+1/3现金】。"
+        banner_icon, banner_zone = "🟡", "结构性存量博弈区 (买阴不买阳 / 严禁追高)"
+        banner_action = f"本土总分({cn_score:.1f}，较前日{cn_score_delta:+.1f})处于存量轮动，全球GSMI({us_gsmi:.1f})。严禁在偏离10MA >5%时追高，坚持10MA缩量回踩分批低吸。"
         border_col = "#FFD700"
     else:
-        banner_icon, banner_zone = "❄️", "本土枯水窒息区 (全面防御模式)"
-        banner_action = f"A股量能萎缩且趋势承压(本土得分{cn_score:.1f})。收回高Beta科技与券商敞口，将仓位锁定在【银行/红利低波】与【高比例现金】中等待冰点过去。"
+        banner_icon, banner_zone = "❄️", "本土枯水窒息区 (现金为王防御模式)"
+        banner_action = f"A股量能萎缩且趋势承压(本土得分{cn_score:.1f})。严控仓位上限，保持高比例现金冗余等待缩量冰点过去。"
         border_col = "#ff6b6b"
 
     status_placeholder.markdown(f"""
@@ -497,7 +573,7 @@ try:
         with r2c4:
             vol_tag = "🔥 增量博弈" if eff_turnover >= 1.8 else ("⚖️ 存量轮动" if eff_turnover >= 1.3 else "❄️ 缩量防守")
             cny_val = latest.get('cny', 6.70)
-            mode_tag = "手动" if cn_turnover_manual > 0 else "自动"
+            mode_tag = "手动" if cn_turnover_manual > 0 else "自动折算"
             st.markdown(f"<div class='card-box'><div class='card-title'>🌊 A股成交({mode_tag}) & 本土ERP</div><div class='card-val'>{eff_turnover:.2f}万亿 <span style='font-size:15px;color:#00ffcc;'>| CNY {cny_val:.4f}</span></div><div class='card-sub'>{vol_tag} | 动态股债利差: +{cn_details['erp_bps']:.0f}bps</div></div>", unsafe_allow_html=True)
 
         st.markdown("---")
@@ -589,22 +665,24 @@ try:
             st.plotly_chart(fig_v, use_container_width=True)
 
     # ------------------------------------------------------------------------------
-    # TAB 2: 行业 ETF 全息 X光 (升级水上/水下分流、真涨/比烂过滤、盘中智能VR)
+    # TAB 2: 行业 ETF 全息 X光 (v2.2 含3日冷却锁、假长上影过滤、避险动量衰减与深坑强反抽识别)
     # ------------------------------------------------------------------------------
     with tabs[1]:
-        st.subheader("🔭 行业板块 ETF 全息 X光扫描 (v2.1 空间分流与智能量比升级版)")
+        st.subheader("🔭 行业板块 ETF 全息 X光扫描 (v2.2 冷却记忆锁与动量衰减升级版)")
         st.markdown("""
-        **v2.1 三大核心升级**：① 区分 **`🎯 水上回踩10MA (偏离50MA > 0 踩地板)`** 与 **`🚧 逼近50MA天花板 (水下冲关防回落)`**；② 区分 **`🌊 稳健吸筹 (真涨)`** 与 **`🛡️ 逆势抗跌 (相对跑赢但绝对价格下跌)`**；③ 盘中自动折算全天预计量能 `VR`。
+        **v2.2 新增防骗机制**：① **3日出逃冷却锁**（近3日发生放量派发未反包者，禁止跳回『最佳甜点』）；② **真实上影线过滤**（上影线回落 `<1.2%` 的低波平盘震荡不再误报出逃）；③ 自动识别 **`⏳ 避险动量衰减 (前期老本)`** 与 **`🌱 深坑强反抽 (5日点火)`**。
         """)
 
         sector_map = {
+            "🔋 储能电池 (集体提价+AIDC配储)": "159566.SZ",
+            "🔬 半导体设备 (地缘刚需+国产扩产)": "159558.SZ",
+            "⚡ 电网设备 (十五五5万亿+出海)": "159326.SZ",
+            "🎬 影视主题 (贺岁春节档+AI漫剧)": "516620.SS",
+            "🧪 细分化工 (制冷剂+锂电材料涨价)": "159870.SZ",
             "🛡️ 大金融/300非银 (券商+保险龙头)": "512070.SS",
             "⚔️ 纯证券公司 (高Beta交易收税机)": "512880.SS",
             "🏦 银行低费率 (息差企稳收租盾)": "516310.SS",
             "⚓ 红利低波 (城商行+实物垄断底座)": "512890.SS",
-            "⚡ 电网设备 (十五五5万亿+出海)": "159326.SZ",
-            "🔋 储能电池 (集体提价+AIDC配储)": "159566.SZ",
-            "🔬 半导体设备 (地缘刚需+国产扩产)": "159558.SZ",
             "📡 通信/光模块 (算力管道)": "515880.SS",
             "⛏️ 有色金属 (铜铝原子源头)": "512400.SS",
             "🔥 能源/煤炭 (高股息基载能源)": "515220.SS",
@@ -622,10 +700,10 @@ try:
             baseline_ticker = "510300.SS" if "沪深300" in baseline else "QQQ"
         with c_base2:
             st.write("")
-            run_xray = st.button("📡 启动全市场行业 ETF 扫描", use_container_width=True)
+            run_xray = st.button("📡 启动全市场 18 大行业 ETF 全息扫描", use_container_width=True)
 
         if run_xray:
-            with st.spinner("正在穿透 16 大核心行业 ETF 的流体力学与量价底稿..."):
+            with st.spinner("正在穿透 18 大核心行业 ETF 的流体力学、冷却记忆锁与量价底稿..."):
                 sector_results = []
                 fetch_start = datetime.now() - timedelta(days=200)
                 base_raw = get_etf_data_v2(baseline_ticker, fetch_start, datetime.now())
@@ -667,16 +745,26 @@ try:
                             candle_range = max(s_high.iloc[-1] - s_low.iloc[-1], 1e-6)
                             candle_pos = (s_close.iloc[-1] - s_low.iloc[-1]) / candle_range
 
-                            # 1. 二维 RS 状态判定 (区分真涨吸筹 vs 被动比烂抗跌)
+                            today_dist = is_bar_distribution(s_close.iloc[-1], s_close.iloc[-2], s_high.iloc[-1], s_low.iloc[-1], vr)
+                            in_cooldown = check_cooldown_lock(s_close, s_high, s_low, s_vol, is_cn_market=is_cn_tkr, lookback=3)
+
+                            # 1. 二维 RS 状态判定 (加入『避险动量衰减』与『深坑强反抽』识别)
                             if rs_20d > 0.03:
                                 if abs_ret_20d <= 0:
                                     state = "🛡️ 逆势抗跌 (相对跑赢/绝对未涨)"
                                 elif rs_5d > 0.05:
                                     state = "🔥 强势吸筹 & 极速逼空"
+                                elif rs_20d > 0.04 and rs_5d < 0.008 and (rs_5d < rs_20d * 0.15):
+                                    state = "⏳ 避险动量衰减 (前期老本/防抽血)"
                                 else:
                                     state = "🌊 稳健吸筹 (中期真涨)"
                             elif rs_20d < -0.03:
-                                state = "🩸 持续失血 & 恐慌抛售" if rs_5d < -0.05 else "📉 阴跌失血 (机构撤离)"
+                                if rs_5d >= 0.04:
+                                    state = "🌱 深坑强反抽 (5日点火/中期修复)"
+                                elif rs_5d < -0.05:
+                                    state = "🩸 持续失血 & 恐慌抛售"
+                                else:
+                                    state = "📉 阴跌失血 (机构撤离)"
                             else:
                                 if rs_5d > 0.05:
                                     state = "🚀 暴力点火 (短期极速反转)"
@@ -685,14 +773,16 @@ try:
                                 else:
                                     state = "⚖️ 随波逐流 (纯 Beta)"
 
-                            # 2. 微观量价照妖镜 (加入 50MA 水上踩地板 vs 水下顶天花板分流)
+                            # 2. 微观量价照妖镜 (含真实振幅过滤 + 3日出逃冷却记忆锁)
                             if bias_10 > 0.08 and vr > 1.5:
                                 micro_mirror = "🚨 乖离过热巨量 (防机构赎回派发)"
-                            elif vr > 1.4 and (ret_1d < -0.015 or candle_pos < 0.35):
+                            elif today_dist:
                                 micro_mirror = "🩸 放量长上影/阴线 (主力出逃)"
+                            elif in_cooldown:
+                                micro_mirror = "⚠️ 分歧冷却期 (近3日派发未反包)"
                             elif vr > 1.3 and ret_1d > 0.015 and candle_pos >= 0.6 and bias_10 <= 0.06:
                                 micro_mirror = "💎 放量真阳起跑 (主动扫货)"
-                            elif -0.022 <= bias_10 <= 0.025 and vr < 0.92 and rs_20d > 0:
+                            elif -0.022 <= bias_10 <= 0.025 and vr < 0.92 and (rs_20d > 0 or rs_5d > 0.01):
                                 if bias_50 >= 0:
                                     micro_mirror = "🎯 水上回踩10MA (右侧最佳甜点)"
                                 elif bias_50 >= -0.038:
@@ -730,37 +820,36 @@ try:
 
                         def color_xray(val):
                             s = str(val)
-                            if "吸筹" in s or "真阳" in s or "水上回踩" in s:
+                            if "稳健吸筹" in s or "强势吸筹" in s or "真阳" in s or "水上回踩" in s:
                                 return 'color: #00ffcc; font-weight: bold;'
-                            elif "点火" in s or "抗跌" in s or "水下回踩" in s:
+                            elif "点火" in s or "强反抽" in s or "水下回踩" in s:
                                 return 'color: #FFD700; font-weight: bold;'
-                            elif "过热" in s or "砸盘" in s or "天花板" in s:
+                            elif "过热" in s or "砸盘" in s or "天花板" in s or "冷却期" in s or "动量衰减" in s or "逆势抗跌" in s:
                                 return 'color: #FF8C00; font-weight: bold;'
                             elif "失血" in s or "出逃" in s:
                                 return 'color: #FF3131; font-weight: bold;'
                             return 'color: #ccc;'
 
-                        st.dataframe(res_df.style.map(color_xray, subset=['二维资金状态', '微观量价照妖镜']), use_container_width=True, height=580)
+                        st.dataframe(res_df.style.map(color_xray, subset=['二维资金状态', '微观量价照妖镜']), use_container_width=True, height=620)
 
     # ------------------------------------------------------------------------------
-    # TAB 3: 猎杀雷达与五步买卖时机状态机 (修复标题重叠 + 盘中智能VR + 水上水下分流)
+    # TAB 3: 猎杀雷达与五步买卖时机状态机 (新增🔔核心龙头扳机 + 3日冷却记忆锁)
     # ------------------------------------------------------------------------------
     with tabs[2]:
-        st.subheader("🎯 猎杀雷达：五步买卖时机精确制导系统")
+        st.subheader("🎯 猎杀雷达：五步买卖时机精确制导系统 (含🔔核心龙头扳机)")
         st.markdown("""
-        自动测算 **均线拓扑结构(水上/水下)、10日乖离率(BIAS)、K线实体饱满度与智能量能(VR)**，精准定位至 **五大买卖档位**：
-        `🎯 1.水上回踩10MA(最佳甜点)` | `🔥 2.起跑突破买点(放量真阳)` | `🚧 逼近50MA天花板(防受阻)` | `🚨 4.乖离过热止盈(禁追高)` | `🩸 5.放量派发/破位清仓`
+        自动测算 **均线拓扑(水上/水下)、3日出逃冷却记忆锁、10日乖离率与第一权重龙头实时表现**：
+        `🎯 1.水上回踩10MA(最佳甜点)` | `🔥 2.起跑突破买点(放量真阳)` | `🌱 3.水下回踩10MA(反弹中继)` | `⚠️ 分歧冷却期(观察3日)` | `🚨 4.乖离过热止盈` | `🩸 5.放量派发/破位`
         """)
 
         ma_period = st.radio(
             "🔭 选择雷达主引力刻度 (MA焦距)", 
             options=[20, 50, 60, 120, 200, 250], 
             index=4, 
-            horizontal=True,
-            help="200MA 确认长期牛熊分界；50/60MA 捕捉中期主升浪；支持直接输入 `代码:均线值` 手动修正。"
+            horizontal=True
         )
 
-        default_snipers = ['159326.SZ', '159558.SZ', '159566.SZ', '512070.SS', '516310.SS', '512890.SS']
+        default_snipers = ['159566.SZ', '159558.SZ', '516620.SS', '159326.SZ', '159870.SZ', '516310.SS']
         sniper_cols = st.columns(6)
         sniper_tickers = []
         manual_ma = {}
@@ -784,7 +873,7 @@ try:
             try:
                 t_data = get_etf_data_v2(t, datetime.now() - timedelta(days=400), datetime.now())
                 if t_data.empty or len(t_data) < 55:
-                    sniper_results.append({"标的": t, "五步买卖时机指令": "❌ 数据为空", "当前价": "-", "10MA低吸价": "-", "偏离50MA": "-", f"价/{ma_period}MA": "-", "10日乖离": "-", "RS 10日/5日": "-", "智能VR": "-"})
+                    sniper_results.append({"标的": t, "当前价": "-", "10MA低吸价": "-", "偏离10MA": "-", "偏离50MA": "-", "智能VR": "-", "🔔 龙头扳机状态": "-", "五步买卖时机指令": "❌ 数据为空"})
                     continue
 
                 t_close = t_data['Close'].ffill().dropna()
@@ -809,32 +898,50 @@ try:
                 if t in manual_ma:
                     ma_main = manual_ma[t]
                     above_main = curr_p >= ma_main
-                    ma_str = f"{(curr_p/ma_main):.2f} (手动)"
                 else:
-                    if len(t_close) < ma_period:
-                        ma_main = ma20_val
-                        above_main = curr_p >= ma_main
-                        ma_str = f"不足{ma_period}天"
-                    else:
-                        ma_main = t_close.rolling(ma_period).mean().iloc[-1]
-                        above_main = curr_p >= ma_main
-                        ma_str = f"{(curr_p/ma_main):.2f}"
+                    ma_main = t_close.rolling(ma_period).mean().iloc[-1] if len(t_close) >= ma_period else ma20_val
+                    above_main = curr_p >= ma_main
 
                 is_cn_t = (".SS" in t or ".SZ" in t or ".SH" in t)
                 vr, is_ext = calc_smart_vr(t_vol, is_cn_market=is_cn_t)
                 vr_str = f"{vr:.2f}*" if is_ext else f"{vr:.2f}"
+
+                today_dist_t = is_bar_distribution(curr_p, t_close.iloc[-2], t_high.iloc[-1], t_low.iloc[-1], vr)
+                cooldown_t = check_cooldown_lock(t_close, t_high, t_low, t_vol, is_cn_market=is_cn_t, lookback=3)
 
                 rs_df = pd.DataFrame({'target': t_close, 'base': df['as300']}).ffill().dropna()
                 rs_curve = rs_df['target'] / rs_df['base']
                 rs_10d = (rs_curve.iloc[-1] / rs_curve.iloc[-10] - 1) * 100 if len(rs_curve) >= 10 else 0.0
                 rs_5d = (rs_curve.iloc[-1] / rs_curve.iloc[-5] - 1) * 100 if len(rs_curve) >= 5 else 0.0
 
-                # 升级后的五步买卖状态机 (含 50MA 水上/水下分流)
+                # 穿透抓取第一权重龙头股实时扳机表现
+                leader_str = "个股/自选"
+                if t in LEADER_MAP:
+                    l_code, l_name = LEADER_MAP[t]
+                    try:
+                        l_df = get_etf_data_v2(l_code, datetime.now() - timedelta(days=40), datetime.now())
+                        if not l_df.empty and len(l_df) >= 12:
+                            l_c = l_df['Close'].ffill().dropna()
+                            l_ret = (l_c.iloc[-1] / l_c.iloc[-2] - 1) * 100
+                            l_ma10 = l_c.rolling(10).mean().iloc[-1]
+                            if l_ret >= 0.5:
+                                l_tag = "✅翻红领涨"
+                            elif l_ret >= -0.5 and l_c.iloc[-1] >= l_ma10 * 0.99:
+                                l_tag = "✅缩量企稳"
+                            else:
+                                l_tag = "⏳回调消化"
+                            leader_str = f"{l_name} {l_ret:+.2f}% ({l_tag})"
+                    except Exception:
+                        leader_str = f"{l_name} (读取中)"
+
+                # 升级后的五步买卖状态机 (含真长上影过滤 + 3日冷却锁 + 水上/水下分流)
                 if bias_10 > 8.0 or ret_3d > 14.5:
                     timing_cmd = "🚨 4.乖离过热止盈 (禁追高/逢高呼气减半)"
-                elif vr > 1.45 and (ret_1d < -1.8 or c_pos < 0.35):
+                elif today_dist_t:
                     timing_cmd = "🩸 5.放量长上影/阴线 (主力派发警惕)"
-                elif (-2.2 <= bias_10 <= 2.5 or -1.8 <= bias_20 <= 2.0) and vr < 0.92 and rs_10d > -2.5:
+                elif cooldown_t:
+                    timing_cmd = "⚠️ 分歧冷却期 (近3日放量派发未反包)"
+                elif (-2.2 <= bias_10 <= 2.5 or -1.8 <= bias_20 <= 2.0) and vr < 0.92 and (rs_10d > -2.5 or rs_5d > 0.5):
                     if bias_50 >= 0:
                         timing_cmd = "🎯 1.水上回踩10MA (右侧最佳甜点)"
                     elif bias_50 >= -3.8:
@@ -847,8 +954,8 @@ try:
                     timing_cmd = "🔥 2.起跑突破买点 (放量真阳右侧主攻)"
                 elif above_main and rs_10d > 0:
                     timing_cmd = "🌊 多头趋势持仓 (等回踩10MA加仓)"
-                elif not above_main and (rs_5d > 1.5 or (vr < 0.70 and bias_20 > -4.0)):
-                    timing_cmd = f"🌱 3.左侧极寒筑底 (RS苏醒/等突破{ma_period}MA)"
+                elif not above_main and (rs_5d > 1.5 or (vr < 0.72 and bias_20 > -4.0)):
+                    timing_cmd = f"🌱 3.左侧极寒筑底 (RS苏醒/等10MA贴合)"
                 else:
                     timing_cmd = "❄️ 5.重力压制/破位 (观望蛰伏)"
 
@@ -856,23 +963,22 @@ try:
                     "标的": t,
                     "当前价": f"{curr_p:.3f}",
                     "10MA低吸价": f"{ma10_val:.3f}",
+                    "偏离10MA": f"{bias_10:+.2f}%",
                     "偏离50MA": f"{bias_50:+.2f}%",
-                    f"价/{ma_period}MA": ma_str,
-                    "10日乖离": f"{bias_10:+.2f}%",
-                    "RS 10日/5日": f"{rs_10d:+.1f}% / {rs_5d:+.1f}%",
                     "智能VR": vr_str,
+                    "🔔 龙头扳机状态": leader_str,
                     "五步买卖时机指令": timing_cmd
                 })
             except Exception as e:
-                sniper_results.append({"标的": t, "当前价": "-", "10MA低吸价": "-", "偏离50MA": "-", f"价/{ma_period}MA": "-", "10日乖离": "-", "RS 10日/5日": "-", "智能VR": "-", "五步买卖时机指令": f"❌ 异常:{str(e)[:12]}"})
+                sniper_results.append({"标的": t, "当前价": "-", "10MA低吸价": "-", "偏离10MA": "-", "偏离50MA": "-", "智能VR": "-", "🔔 龙头扳机状态": "-", "五步买卖时机指令": f"❌ 异常:{str(e)[:12]}"})
 
         if sniper_results:
             st.table(pd.DataFrame(sniper_results))
-            st.caption("注：智能VR带 `*` 号代表当前处于 A 股盘中交易时段，已按开盘分钟数自动折算为全天预计量比。")
+            st.caption("注：智能VR带 `*` 号代表盘中自动按开盘分钟折算；当『五步买卖时机指令』处于回踩10MA且『🔔 龙头扳机状态』显示 ✅企稳/翻红时，为最佳开火瞬间。")
 
         st.write("---")
         st.markdown("#### 🔍 单项标的价格均线 (10/20/50/200MA) 与 RS 相对强度双轨透视")
-        audit_ticker = st.text_input("输入要深度透视买点的 ETF 或个股代码", "159558.SZ", key="single_v2")
+        audit_ticker = st.text_input("输入要深度透视买点的 ETF 或个股代码", "159566.SZ", key="single_v2")
         if audit_ticker:
             clean_tkr = audit_ticker.strip()
             a_data = get_etf_data_v2(clean_tkr, datetime.now() - timedelta(days=400), datetime.now())
@@ -888,7 +994,6 @@ try:
 
                 p_col1, p_col2 = st.columns(2)
                 with p_col1:
-                    # 独立小标题，彻底消除与图例重叠问题
                     st.markdown(f"##### 📈 {clean_tkr} 价格与 10/20/50/200MA 买点透视图 (智能VR: {vr_tag})")
                     fig_p = go.Figure()
                     fig_p.add_trace(go.Scatter(x=a_close.index[-180:], y=a_close.tail(180), name="收盘价", line=dict(color='#00ffcc', width=2.5)))
@@ -920,20 +1025,20 @@ try:
         preset_mode = st.radio(
             "⚡ 快捷对决模式切换 (或选第5项自由输入任意代码)：",
             [
-                "1. 金融攻守内战：300非银 (512070.SS) vs 银行 (516310.SS)",
-                "2. 大盘风格总开关：创业板指 (159915.SZ) vs 红利低波 (512890.SS)",
+                "1. 算电基建内战：储能电池 (159566.SZ) vs 电网设备 (159326.SZ)",
+                "2. 大盘风格总开关：创业板指 (159915.SZ) vs 银行低费率 (516310.SS)",
                 "3. 科技内外循环：半导体设备 (159558.SZ) vs 通信光模块 (515880.SS)",
-                "4. 电力基建双雄：电网设备 (159326.SZ) vs 储能电池 (159566.SZ)",
+                "4. 跨界轮动对比：储能电池 (159566.SZ) vs 影视主题 (516620.SS)",
                 "5. 自由定制对决：手动输入任意两个 ETF/股票代码"
             ],
             horizontal=False
         )
 
         preset_dict = {
-            "1.": ("512070.SS", "516310.SS", "300非银(进攻)", "银行ETF(防守)"),
-            "2.": ("159915.SZ", "512890.SS", "创业板(成长矛)", "红利低波(收租盾)"),
-            "3.": ("159558.SZ", "515880.SS", "半导体设备(内循环)", "通信光模块(出海链)"),
-            "4.": ("159326.SZ", "159566.SZ", "电网设备(特高压)", "储能电池(AIDC配储)")
+            "1.": ("159566.SZ", "159326.SZ", "储能电池(高弹矛)", "电网设备(稳健盾)"),
+            "2.": ("159915.SZ", "516310.SS", "创业板(成长重启)", "银行ETF(防御抱团)"),
+            "3.": ("159558.SZ", "515880.SS", "半导体设备(内循环)", "通信光模块(外循环)"),
+            "4.": ("159566.SZ", "516620.SS", "储能电池(算电制造)", "影视ETF(AI漫剧/贺岁)")
         }
 
         key_prefix = preset_mode[:2]
@@ -962,10 +1067,10 @@ try:
                         verdict = f"🔥 【{ticker_a}】全面胜出！A/B比值站上20日均线且短期加速({r_5d:+.2f}%)，资金正从 {ticker_b} 抽血流向 {ticker_a}，配置重心应果断向【{ticker_a}】倾斜！"
                         v_col = "#00ffcc"
                     elif not above_ma20 and r_5d < 0:
-                        verdict = f"🛡️ 【{ticker_b}】全面胜出！A/B比值跌破20日均线({r_5d:+.2f}%)，市场处于防御/切换态势，配置重心应果断向【{ticker_b}】倾斜！"
+                        verdict = f"🛡️ 【{ticker_b}】全面胜出！A/B比值跌破20日均线({r_5d:+.2f}%)，市场处于切换态势，配置重心应果断向【{ticker_b}】倾斜！"
                         v_col = "#FFD700"
                     else:
-                        verdict = f"⚖️ 双雄处于风格切换临界期（20日相对动量 {r_20d:+.2f}%，5日相对动量 {r_5d:+.2f}%），建议采取均衡配比。"
+                        verdict = f"⚖️ 双雄处于风格切换临界期（20日相对动量 {r_20d:+.2f}%，5日相对动量 {r_5d:+.2f}%），建议采取均衡分批策略。"
                         v_col = "#ccc"
 
                     st.markdown(f"<div class='quadrant-box' style='border-color:{v_col};'><h4 style='color:{v_col};margin:0;'>{verdict}</h4></div>", unsafe_allow_html=True)
@@ -977,10 +1082,10 @@ try:
                     st.plotly_chart(fig_ab, use_container_width=True)
 
         st.write("---")
-        st.subheader("🕸️ 跨周期正交沙盘：进攻舱 vs 防守舱相关性防坍塌检验")
+        st.subheader("🕸️ 跨周期正交沙盘：进攻舱 vs 轮动/防守舱相关性防坍塌检验")
         col_p1, col_p2 = st.columns(2)
-        off_input = col_p1.text_input("⚔️ 第一舱（进攻与成长舱，逗号分隔）", value="159326.SZ, 159558.SZ, 159566.SZ")
-        def_input = col_p2.text_input("🛡️ 第二舱（防守与赔率舱，逗号分隔）", value="512070.SS, 516310.SS, 512890.SS")
+        off_input = col_p1.text_input("⚔️ 第一舱（核心科技与制造舱，逗号分隔）", value="159566.SZ, 159558.SZ")
+        def_input = col_p2.text_input("🛡️ 第二舱（低相关轮动与防守舱，逗号分隔）", value="516620.SS, 516310.SS, 518880.SS")
 
         off_list = [x.strip() for x in off_input.split(",") if x.strip()]
         def_list = [x.strip() for x in def_input.split(",") if x.strip()]
@@ -1004,9 +1109,9 @@ try:
                 avg_cross = np.mean(cross_corrs) if cross_corrs else 0.0
 
                 if avg_cross > 0.70:
-                    st.error(f"🚨 跨舱维度坍塌警告：你的【进攻舱】与【防守舱】平均相关系数高达 {avg_cross:.2f} (>0.70)！大盘暴跌时无法起到对冲保护作用。")
+                    st.error(f"🚨 跨舱维度坍塌警告：你的【第一舱】与【第二舱】平均相关系数高达 {avg_cross:.2f} (>0.70)！属于同一条产业链重复下注。")
                 else:
-                    st.success(f"✅ 跨舱正交化极佳：【进攻舱】与【防守舱】平均相关系数仅为 {avg_cross:.2f}，攻守双肺形成了坚固的对冲保护。")
+                    st.success(f"✅ 跨舱正交化极佳：【第一舱】与【第二舱】平均相关系数仅为 {avg_cross:.2f}，形成了真正独立的风险分散保护。")
 
                 st.markdown("##### 🕸️ 持仓组合近 60 日底层相关系数热力图")
                 fig_corr = go.Figure(data=go.Heatmap(
@@ -1022,19 +1127,19 @@ try:
     # ------------------------------------------------------------------------------
     with tabs[4]:
         st.subheader("🛡️ 三三制 ATR 仓位几何与自动挂单表")
-        st.markdown("输入你的账户总资金与三三制舱位比例，系统自动读取你在 Tab 4 设定的【进攻舱】与【防守舱】标的，批量生成 **10MA 低吸挂单价、50MA 颈线位、2倍 ATR 硬止损线与建议买入股数**。")
+        st.markdown("输入你的账户总资金与舱位比例，系统自动读取你在 Tab 4 设定的【第一舱】与【第二舱】标的，批量生成 **10MA 低吸挂单价、20MA 生命线、50MA 颈线与 2倍 ATR 硬止损线**。")
 
         p1, p2, p3, p4 = st.columns(4)
         total_cap = p1.number_input("💰 账户总本金 (¥)", value=1000000, step=100000)
-        off_pct = p2.number_input("⚔️ 进攻舱总配额 (%)", value=33.0, step=1.0, max_value=60.0)
-        def_pct = p3.number_input("🛡️ 防守舱总配额 (%)", value=35.0, step=1.0, max_value=60.0)
+        off_pct = p2.number_input("⚔️ 第一舱总配额 (%)", value=33.0, step=1.0, max_value=60.0)
+        def_pct = p3.number_input("🛡️ 第二舱总配额 (%)", value=25.0, step=1.0, max_value=60.0)
         atr_mult = p4.number_input("📏 止损宽度 (倍数 ATR)", value=2.0, step=0.1)
 
         cash_pct = max(0.0, 100.0 - off_pct - def_pct)
-        st.info(f"📊 **当前三三制资金划分**：⚔️ 进攻舱配额 **¥{total_cap*off_pct/100:,.0f} ({off_pct:.0f}%)** &nbsp;|&nbsp; 🛡️ 防守舱配额 **¥{total_cap*def_pct/100:,.0f} ({def_pct:.0f}%)** &nbsp;|&nbsp; 💧 现金冗余 **¥{total_cap*cash_pct/100:,.0f} ({cash_pct:.0f}%)**")
+        st.info(f"📊 **当前资金划分**：⚔️ 第一舱配额 **¥{total_cap*off_pct/100:,.0f} ({off_pct:.0f}%)** &nbsp;|&nbsp; 🛡️ 第二舱配额 **¥{total_cap*def_pct/100:,.0f} ({def_pct:.0f}%)** &nbsp;|&nbsp; 💧 现金冗余 **¥{total_cap*cash_pct/100:,.0f} ({cash_pct:.0f}%)**")
 
         batch_rows = []
-        for bucket_name, t_list, bucket_pct in [("⚔️ 进攻舱", off_list, off_pct), ("🛡️ 防守舱", def_list, def_pct)]:
+        for bucket_name, t_list, bucket_pct in [("⚔️ 第一舱", off_list, off_pct), ("🛡️ 第二舱", def_list, def_pct)]:
             if not t_list:
                 continue
             per_slot_cap = (total_cap * (bucket_pct / 100.0)) / len(t_list)
@@ -1078,10 +1183,11 @@ try:
 
         if batch_rows:
             st.table(pd.DataFrame(batch_rows))
-            st.caption("💡 实战执行纪律：处于『🚨 乖离过热』或『🚧 逼近50MA天花板』的标的，严禁按现价盲目追高，耐心挂单在【🎯 10MA低吸价】或等待放量站稳【🚧 50MA颈线】后再吸气。")
+            st.caption("💡 实战执行纪律：处于『🚨 乖离过热』、『⚠️ 分歧冷却期』或『🚧 逼近50MA天花板』的标的，严禁按现价盲目追高，耐心挂单在【🎯 10MA低吸价】或【📏 20MA生命线】附近分批吸气。")
 
 except Exception as e:
     st.error(f"系统运行中发生错误: {e}")
 
 st.markdown("---")
-st.caption("🏹 GSMI Dual-Core v2.1 | 全球宏观与本土行业 | 三三制正交风控体系")
+st.caption("🏹 GSMI Dual-Core v2.2 | 全球宏观与本土行业 | 三三制正交风控体系")
+```!]
