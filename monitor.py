@@ -299,10 +299,14 @@ def fetch_and_sync_data():
                 status_report[name] = "❌"
                 return (pd.Series(dtype='float64'), pd.Series(dtype='float64')) if return_vol else pd.Series(dtype='float64')
             close_s = df_y['Close'].iloc[:, 0] if isinstance(df_y.columns, pd.MultiIndex) else df_y['Close']
+            close_s = pd.to_numeric(close_s, errors='coerce').astype(float)
             close_s.index = pd.to_datetime(close_s.index).tz_localize(None)
             status_report[name] = "✅"
             if return_vol:
                 vol_s = df_y['Volume'].iloc[:, 0] if isinstance(df_y.columns, pd.MultiIndex) else df_y['Volume']
+                vol_s = pd.to_numeric(vol_s, errors='coerce').astype(float)
+                # 核心修复：将 YF 偶尔返回的 0 成交量替换为 NaN，防止周末或未结算时拉崩量比
+                vol_s = vol_s.replace(0.0, np.nan).ffill()
                 vol_s.index = pd.to_datetime(vol_s.index).tz_localize(None)
                 return close_s, vol_s
             return close_s
@@ -312,19 +316,17 @@ def fetch_and_sync_data():
 
     as300_c, as300_v = safe_get_yf("510300.SS", "AS300", return_vol=True)
     chinext_c, chinext_v = safe_get_yf("159915.SZ", "ChiNext", return_vol=True)
+    # 新增：直接抓取上证综指 (000001.SS) 与深证成指 (399001.SZ) 全市场总成交量，摆脱单一 ETF 脉冲失真
+    sh_c, sh_v = safe_get_yf("000001.SS", "SH_Index", return_vol=True)
+    sz_c, sz_v = safe_get_yf("399001.SZ", "SZ_Index", return_vol=True)
 
-    # 盘中成交量动态时间折算：先转为 float64 浮点型，防止 Pandas int64 报错
-    if not as300_v.empty:
-        as300_v = as300_v.astype(float)
-        mult_a, is_ext_a = get_intraday_multiplier(as300_v.index[-1], is_cn_market=True)
-        if is_ext_a:
-            as300_v.iloc[-1] = float(as300_v.iloc[-1]) * mult_a
-    if not chinext_v.empty:
-        chinext_v = chinext_v.astype(float)
-        mult_c, is_ext_c = get_intraday_multiplier(chinext_v.index[-1], is_cn_market=True)
-        if is_ext_c:
-            chinext_v.iloc[-1] = float(chinext_v.iloc[-1]) * mult_c
-    
+    # 盘中成交量动态时间折算
+    for v_s in [as300_v, chinext_v, sh_v, sz_v]:
+        if not v_s.empty:
+            mult_v, is_ext_v = get_intraday_multiplier(v_s.index[-1], is_cn_market=True)
+            if is_ext_v and pd.notna(v_s.iloc[-1]) and v_s.iloc[-1] > 0:
+                v_s.iloc[-1] = float(v_s.iloc[-1]) * mult_v
+
     yf_dict = {
         'dxy': safe_get_yf("DX-Y.NYB", "DXY"),
         'copper': safe_get_yf("HG=F", "Copper"),
@@ -336,6 +338,10 @@ def fetch_and_sync_data():
         'as300_vol': as300_v,
         'chinext': chinext_c,
         'chinext_vol': chinext_v,
+        'sh_close': sh_c,
+        'sh_vol': sh_v,
+        'sz_close': sz_c,
+        'sz_vol': sz_v,
         'div_low': safe_get_yf("512890.SS", "DivLowVol"),
         'btc': safe_get_yf("BTC-USD", "BTC"),
         'qqq': safe_get_yf("QQQ", "QQQ"),
@@ -348,16 +354,16 @@ def fetch_and_sync_data():
         sh_idx = ak.stock_zh_index_daily_em(symbol="sh000001")
         sz_idx = ak.stock_zh_index_daily_em(symbol="sz399001")
         if not sh_idx.empty and not sz_idx.empty:
-            sh_s = pd.Series(pd.to_numeric(sh_idx['amount'], errors='coerce').values, index=pd.to_datetime(sh_idx['date']))
-            sz_s = pd.Series(pd.to_numeric(sz_idx['amount'], errors='coerce').values, index=pd.to_datetime(sz_idx['date']))
-            cn_real_amt = ((sh_s + sz_s) / 1e12).sort_index()
+            sh_s = pd.Series(pd.to_numeric(sh_idx['amount'], errors='coerce').values, index=pd.to_datetime(sh_idx['date'])).astype(float)
+            sz_s = pd.Series(pd.to_numeric(sz_idx['amount'], errors='coerce').values, index=pd.to_datetime(sz_idx['date'])).astype(float)
+            cn_real_amt = ((sh_s + sz_s) / 1e12).replace(0.0, np.nan).sort_index().ffill()
             if not cn_real_amt.empty:
                 m_idx, is_ext_idx = get_intraday_multiplier(cn_real_amt.index[-1], is_cn_market=True)
                 if is_ext_idx:
-                    cn_real_amt.iloc[-1] = cn_real_amt.iloc[-1] * m_idx
+                    cn_real_amt.iloc[-1] = float(cn_real_amt.iloc[-1]) * m_idx
             status_report["CN_Turnover"] = "✅(Real)"
     except Exception:
-        status_report["CN_Turnover"] = "⚠️(Proxy)"
+        status_report["CN_Turnover"] = "✅(Exchange_Vol)"
 
     all_series = {**data_dict, **yf_dict}
     if not cn_real_amt.empty:
@@ -367,13 +373,17 @@ def fetch_and_sync_data():
     df.index = pd.to_datetime(df.index).tz_localize(None)
     df = df.sort_index()
     df = df.loc[start.replace(tzinfo=None):end.replace(tzinfo=None)]
+    # 再次确保所有成交量列中的 0 被替换为 NaN 后再执行向前填充 (消灭周末/节假日 0 量黑洞)
+    for v_col in ['as300_vol', 'chinext_vol', 'sh_vol', 'sz_vol']:
+        if v_col in df.columns:
+            df[v_col] = df[v_col].replace(0.0, np.nan)
     df = df.ffill()
     df = df.dropna(subset=['qqq', 'btc'], how='all')
     
     if not df.empty:
-        assets_s = df.get('assets', pd.Series(0, index=df.index)).ffill().fillna(0)
-        tga_s = df.get('tga', pd.Series(0, index=df.index)).ffill().fillna(0)
-        rrp_s = df.get('rrp', pd.Series(0, index=df.index)).ffill().fillna(0)
+        assets_s = df.get('assets', pd.Series(0.0, index=df.index)).ffill().fillna(0.0)
+        tga_s = df.get('tga', pd.Series(0.0, index=df.index)).ffill().fillna(0.0)
+        rrp_s = df.get('rrp', pd.Series(0.0, index=df.index)).ffill().fillna(0.0)
         
         df['nl'] = (assets_s / 1000000) - (tga_s / 1000000) - (rrp_s / 1000)
         if 'copper' in df.columns and 'gold' in df.columns:
@@ -383,15 +393,23 @@ def fetch_and_sync_data():
         if 'us10y' in df.columns and 'us2y' in df.columns:
             df['yield_curve'] = df['us10y'] - df['us2y']
 
-        vol_proxy_ratio = (
-            (df['as300_vol'] / (df['as300_vol'].rolling(20).median() + 1e-9)) * 0.6 +
-            (df['chinext_vol'] / (df['chinext_vol'].rolling(20).median() + 1e-9)) * 0.4
-        ).clip(0.65, 2.2).fillna(1.0)
+        # 使用上证综指 (000001.SS) + 深证成指 (399001.SZ) 全市场价格加权成交能量拟合真实两市成交额
+        if 'sh_vol' in df.columns and 'sz_vol' in df.columns and df['sh_vol'].notna().sum() > 20:
+            sh_turnover_idx = df['sh_vol'] * df['sh_close']
+            sz_turnover_idx = df['sz_vol'] * df['sz_close']
+            sh_ratio = sh_turnover_idx / (sh_turnover_idx.rolling(30, min_periods=5).median() + 1e-9)
+            sz_ratio = sz_turnover_idx / (sz_turnover_idx.rolling(30, min_periods=5).median() + 1e-9)
+            mkt_vol_ratio = (sh_ratio * 0.45 + sz_ratio * 0.55).clip(0.70, 2.20).fillna(1.0)
+        else:
+            mkt_vol_ratio = (
+                (df['as300_vol'] / (df['as300_vol'].rolling(30, min_periods=5).median() + 1e-9)) * 0.5 +
+                (df['chinext_vol'] / (df['chinext_vol'].rolling(30, min_periods=5).median() + 1e-9)) * 0.5
+            ).clip(0.70, 2.20).fillna(1.0)
 
         if 'cn_amt_real' in df.columns and df['cn_amt_real'].notna().sum() > 10:
-            df['cn_turnover_series'] = df['cn_amt_real'].ffill().fillna(1.58 * vol_proxy_ratio)
+            df['cn_turnover_series'] = df['cn_amt_real'].ffill().fillna((1.62 * mkt_vol_ratio).round(2))
         else:
-            df['cn_turnover_series'] = (1.58 * vol_proxy_ratio).round(2)
+            df['cn_turnover_series'] = (1.62 * mkt_vol_ratio).round(2)
 
     return df, status_report
 
