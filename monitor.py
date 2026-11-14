@@ -46,9 +46,9 @@ cn_10y_bond = st.sidebar.number_input(
 
 st.sidebar.markdown("---")
 st.sidebar.header("🗳️ BofA FMS 与 TGA 配置")
-DEFAULT_FMS_CASH = 3.9
+DEFAULT_FMS_CASH = 3.2
 fms_cash = st.sidebar.slider("FMS 机构现金水平 (%)", 3.0, 6.5, DEFAULT_FMS_CASH, 0.1)
-tga_target = st.sidebar.number_input("本季末 TGA 余额目标 (十亿$)", value=950, step=50)
+tga_target = st.sidebar.number_input("本季末 TGA 余额目标 (十亿$)", value=850, step=50)
 
 if "fred_api_key" in st.secrets:
     fred_key = st.secrets["fred_api_key"]
