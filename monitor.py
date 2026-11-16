@@ -258,8 +258,9 @@ def get_tga_forecast(curr_tga_billion, target_val):
     gap = target_val - curr_tga_billion
     return msg, gap, risk
 
-@st.cache_data(ttl=1200)
+@st.cache_data(ttl=600)
 def fetch_and_sync_data():
+    import urllib.request
     end = datetime.now()
     start = end - timedelta(days=500)
     status_report = {}
@@ -305,7 +306,6 @@ def fetch_and_sync_data():
             if return_vol:
                 vol_s = df_y['Volume'].iloc[:, 0] if isinstance(df_y.columns, pd.MultiIndex) else df_y['Volume']
                 vol_s = pd.to_numeric(vol_s, errors='coerce').astype(float)
-                # 核心修复：将 YF 偶尔返回的 0 成交量替换为 NaN，防止周末或未结算时拉崩量比
                 vol_s = vol_s.replace(0.0, np.nan).ffill()
                 vol_s.index = pd.to_datetime(vol_s.index).tz_localize(None)
                 return close_s, vol_s
@@ -316,12 +316,9 @@ def fetch_and_sync_data():
 
     as300_c, as300_v = safe_get_yf("510300.SS", "AS300", return_vol=True)
     chinext_c, chinext_v = safe_get_yf("159915.SZ", "ChiNext", return_vol=True)
-    # 新增：直接抓取上证综指 (000001.SS) 与深证成指 (399001.SZ) 全市场总成交量，摆脱单一 ETF 脉冲失真
-    sh_c, sh_v = safe_get_yf("000001.SS", "SH_Index", return_vol=True)
-    sz_c, sz_v = safe_get_yf("399001.SZ", "SZ_Index", return_vol=True)
 
-    # 盘中成交量动态时间折算
-    for v_s in [as300_v, chinext_v, sh_v, sz_v]:
+    # 盘中成交量动态时间折算 (仅对 ETF 真实份额成交量执行，避免指数单位错乱)
+    for v_s in [as300_v, chinext_v]:
         if not v_s.empty:
             mult_v, is_ext_v = get_intraday_multiplier(v_s.index[-1], is_cn_market=True)
             if is_ext_v and pd.notna(v_s.iloc[-1]) and v_s.iloc[-1] > 0:
@@ -338,10 +335,6 @@ def fetch_and_sync_data():
         'as300_vol': as300_v,
         'chinext': chinext_c,
         'chinext_vol': chinext_v,
-        'sh_close': sh_c,
-        'sh_vol': sh_v,
-        'sz_close': sz_c,
-        'sz_vol': sz_v,
         'div_low': safe_get_yf("512890.SS", "DivLowVol"),
         'btc': safe_get_yf("BTC-USD", "BTC"),
         'qqq': safe_get_yf("QQQ", "QQQ"),
@@ -349,32 +342,33 @@ def fetch_and_sync_data():
         'vix': safe_get_yf("^VIX", "VIX")
     }
 
-    cn_real_amt = pd.Series(dtype='float64')
+    # --- 核心升级：直接通过腾讯全球 CDN 读取沪深两市官方精确成交额 (万亿元) ---
+    tx_live_turnover = None
     try:
-        sh_idx = ak.stock_zh_index_daily_em(symbol="sh000001")
-        sz_idx = ak.stock_zh_index_daily_em(symbol="sz399001")
-        if not sh_idx.empty and not sz_idx.empty:
-            sh_s = pd.Series(pd.to_numeric(sh_idx['amount'], errors='coerce').values, index=pd.to_datetime(sh_idx['date'])).astype(float)
-            sz_s = pd.Series(pd.to_numeric(sz_idx['amount'], errors='coerce').values, index=pd.to_datetime(sz_idx['date'])).astype(float)
-            cn_real_amt = ((sh_s + sz_s) / 1e12).replace(0.0, np.nan).sort_index().ffill()
-            if not cn_real_amt.empty:
-                m_idx, is_ext_idx = get_intraday_multiplier(cn_real_amt.index[-1], is_cn_market=True)
-                if is_ext_idx:
-                    cn_real_amt.iloc[-1] = float(cn_real_amt.iloc[-1]) * m_idx
-            status_report["CN_Turnover"] = "✅(Real)"
+        req = urllib.request.Request(
+            "http://qt.gtimg.cn/q=s_sh000001,s_sz399001",
+            headers={'User-Agent': 'Mozilla/5.0'}
+        )
+        raw_txt = urllib.request.urlopen(req, timeout=4).read().decode('gbk', errors='ignore')
+        lines = [line for line in raw_txt.strip().split(';') if '~' in line]
+        if len(lines) >= 2:
+            # 腾讯接口第 7 个字段为成交额(万元)，相加除以 1e8 即为精确的两市成交额(万亿元)
+            sh_amt_wan = float(lines[0].split('~')[7])
+            sz_amt_wan = float(lines[1].split('~')[7])
+            raw_trillion = (sh_amt_wan + sz_amt_wan) / 1e8
+            if raw_trillion > 0.1:
+                mult_tx, is_ext_tx = get_intraday_multiplier(datetime.now(), is_cn_market=True)
+                tx_live_turnover = round(raw_trillion * (mult_tx if is_ext_tx else 1.0), 2)
+                status_report["CN_Turnover"] = f"✅({tx_live_turnover}T)"
     except Exception:
-        status_report["CN_Turnover"] = "✅(Exchange_Vol)"
+        status_report["CN_Turnover"] = "⚠️(ETF_Proxy)"
 
     all_series = {**data_dict, **yf_dict}
-    if not cn_real_amt.empty:
-        all_series['cn_amt_real'] = cn_real_amt
-
     df = pd.DataFrame(all_series)
     df.index = pd.to_datetime(df.index).tz_localize(None)
     df = df.sort_index()
     df = df.loc[start.replace(tzinfo=None):end.replace(tzinfo=None)]
-    # 再次确保所有成交量列中的 0 被替换为 NaN 后再执行向前填充 (消灭周末/节假日 0 量黑洞)
-    for v_col in ['as300_vol', 'chinext_vol', 'sh_vol', 'sz_vol']:
+    for v_col in ['as300_vol', 'chinext_vol']:
         if v_col in df.columns:
             df[v_col] = df[v_col].replace(0.0, np.nan)
     df = df.ffill()
@@ -393,26 +387,18 @@ def fetch_and_sync_data():
         if 'us10y' in df.columns and 'us2y' in df.columns:
             df['yield_curve'] = df['us10y'] - df['us2y']
 
-        # 使用上证综指 (000001.SS) + 深证成指 (399001.SZ) 全市场价格加权成交能量拟合真实两市成交额
-        if 'sh_vol' in df.columns and 'sz_vol' in df.columns and df['sh_vol'].notna().sum() > 20:
-            sh_turnover_idx = df['sh_vol'] * df['sh_close']
-            sz_turnover_idx = df['sz_vol'] * df['sz_close']
-            sh_ratio = sh_turnover_idx / (sh_turnover_idx.rolling(30, min_periods=5).median() + 1e-9)
-            sz_ratio = sz_turnover_idx / (sz_turnover_idx.rolling(30, min_periods=5).median() + 1e-9)
-            mkt_vol_ratio = (sh_ratio * 0.45 + sz_ratio * 0.55).clip(0.70, 2.20).fillna(1.0)
-        else:
-            mkt_vol_ratio = (
-                (df['as300_vol'] / (df['as300_vol'].rolling(30, min_periods=5).median() + 1e-9)) * 0.5 +
-                (df['chinext_vol'] / (df['chinext_vol'].rolling(30, min_periods=5).median() + 1e-9)) * 0.5
-            ).clip(0.70, 2.20).fillna(1.0)
+        # 历史序列使用 ETF 稳健中位数比值回溯，最新一日直接注入腾讯官方精确成交额！
+        mkt_vol_ratio = (
+            (df['as300_vol'] / (df['as300_vol'].rolling(30, min_periods=5).median() + 1e-9)) * 0.5 +
+            (df['chinext_vol'] / (df['chinext_vol'].rolling(30, min_periods=5).median() + 1e-9)) * 0.5
+        ).clip(0.75, 1.45).fillna(1.0)
 
-        if 'cn_amt_real' in df.columns and df['cn_amt_real'].notna().sum() > 10:
-            df['cn_turnover_series'] = df['cn_amt_real'].ffill().fillna((1.62 * mkt_vol_ratio).round(2))
-        else:
-            df['cn_turnover_series'] = (1.62 * mkt_vol_ratio).round(2)
+        df['cn_turnover_series'] = (1.58 * mkt_vol_ratio).round(2)
+        if tx_live_turnover is not None and tx_live_turnover > 0.3:
+            df.iloc[-1, df.columns.get_loc('cn_turnover_series')] = tx_live_turnover
 
     return df, status_report
-
+    
 def calculate_dual_scores(df, fms_val, cn_turnover_input, cn_bond):
     if df.empty:
         return df, 50.0, 1.55, {}
