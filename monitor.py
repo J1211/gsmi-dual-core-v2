@@ -314,13 +314,14 @@ def fetch_and_sync_data():
             status_report[name] = "❌"
             return (pd.Series(dtype='float64'), pd.Series(dtype='float64')) if return_vol else pd.Series(dtype='float64')
 
+    # 🚨 核心修复：改用四大宽基 ETF (510300沪深300 + 510500中证500 + 159915创业板 + 588000科创50)，彻底消灭指数100倍单位错位Bug
     as300_c, as300_v = safe_get_yf("510300.SS", "AS300", return_vol=True)
     chinext_c, chinext_v = safe_get_yf("159915.SZ", "ChiNext", return_vol=True)
-    sh_c, sh_v = safe_get_yf("000001.SS", "SH_Index", return_vol=True)
-    sz_c, sz_v = safe_get_yf("399001.SZ", "SZ_Index", return_vol=True)
+    zz500_c, zz500_v = safe_get_yf("510500.SS", "ZZ500", return_vol=True)
+    kc50_c, kc50_v = safe_get_yf("588000.SS", "KC50", return_vol=True)
 
     # 盘中成交量 U型曲线动态时间折算
-    for v_s in [as300_v, chinext_v, sh_v, sz_v]:
+    for v_s in [as300_v, chinext_v, zz500_v, kc50_v]:
         if not v_s.empty:
             mult_v, is_ext_v = get_intraday_multiplier(v_s.index[-1], is_cn_market=True)
             if is_ext_v and pd.notna(v_s.iloc[-1]) and v_s.iloc[-1] > 0:
@@ -337,10 +338,10 @@ def fetch_and_sync_data():
         'as300_vol': as300_v,
         'chinext': chinext_c,
         'chinext_vol': chinext_v,
-        'sh_close': sh_c,
-        'sh_vol': sh_v,
-        'sz_close': sz_c,
-        'sz_vol': sz_v,
+        'zz500': zz500_c,
+        'zz500_vol': zz500_v,
+        'kc50': kc50_c,
+        'kc50_vol': kc50_v,
         'div_low': safe_get_yf("512890.SS", "DivLowVol"),
         'btc': safe_get_yf("BTC-USD", "BTC"),
         'qqq': safe_get_yf("QQQ", "QQQ"),
@@ -362,7 +363,7 @@ def fetch_and_sync_data():
                     cn_real_amt.iloc[-1] = float(cn_real_amt.iloc[-1]) * m_idx
             status_report["CN_Turnover"] = "✅(Real_U)"
     except Exception:
-        status_report["CN_Turnover"] = "✅(Idx_U_Proxy)"
+        status_report["CN_Turnover"] = "✅(4ETF_U_Median)"
 
     all_series = {**data_dict, **yf_dict}
     if not cn_real_amt.empty:
@@ -372,7 +373,7 @@ def fetch_and_sync_data():
     df.index = pd.to_datetime(df.index).tz_localize(None)
     df = df.sort_index()
     df = df.loc[start.replace(tzinfo=None):end.replace(tzinfo=None)]
-    for v_col in ['as300_vol', 'chinext_vol', 'sh_vol', 'sz_vol']:
+    for v_col in ['as300_vol', 'chinext_vol', 'zz500_vol', 'kc50_vol']:
         if v_col in df.columns:
             df[v_col] = df[v_col].replace(0.0, np.nan)
     df = df.ffill()
@@ -391,25 +392,26 @@ def fetch_and_sync_data():
         if 'us10y' in df.columns and 'us2y' in df.columns:
             df['yield_curve'] = df['us10y'] - df['us2y']
 
-        if 'sh_vol' in df.columns and 'sz_vol' in df.columns and df['sh_vol'].notna().sum() > 20:
-            sh_turnover_idx = df['sh_vol'] * df['sh_close']
-            sz_turnover_idx = df['sz_vol'] * df['sz_close']
-            sh_ratio = sh_turnover_idx / (sh_turnover_idx.rolling(30, min_periods=5).median() + 1e-9)
-            sz_ratio = sz_turnover_idx / (sz_turnover_idx.rolling(30, min_periods=5).median() + 1e-9)
-            mkt_vol_ratio = (sh_ratio * 0.45 + sz_ratio * 0.55).clip(0.70, 2.20).fillna(1.0)
+        # 用四大旗舰宽基 ETF 的成交额比值【中位数】来平滑拟合全市场成交额，彻底免疫单只ETF异常脉冲与指数100倍单位Bug
+        ratio_cols = []
+        for p_col, v_col in [('as300', 'as300_vol'), ('chinext', 'chinext_vol'), ('zz500', 'zz500_vol'), ('kc50', 'kc50_vol')]:
+            if p_col in df.columns and v_col in df.columns and df[v_col].notna().sum() > 20:
+                amt_s = df[p_col] * df[v_col]
+                r_s = amt_s / (amt_s.rolling(30, min_periods=5).median() + 1e-9)
+                ratio_cols.append(r_s)
+
+        if ratio_cols:
+            mkt_vol_ratio = pd.concat(ratio_cols, axis=1).median(axis=1).clip(0.65, 2.20).fillna(1.0)
         else:
-            mkt_vol_ratio = (
-                (df['as300_vol'] / (df['as300_vol'].rolling(30, min_periods=5).median() + 1e-9)) * 0.5 +
-                (df['chinext_vol'] / (df['chinext_vol'].rolling(30, min_periods=5).median() + 1e-9)) * 0.5
-            ).clip(0.70, 2.20).fillna(1.0)
+            mkt_vol_ratio = pd.Series(1.0, index=df.index)
 
         if 'cn_amt_real' in df.columns and df['cn_amt_real'].notna().sum() > 10:
-            df['cn_turnover_series'] = df['cn_amt_real'].ffill().fillna((1.60 * mkt_vol_ratio).round(2))
+            df['cn_turnover_series'] = df['cn_amt_real'].ffill().fillna((1.58 * mkt_vol_ratio).round(2))
         else:
-            df['cn_turnover_series'] = (1.60 * mkt_vol_ratio).round(2)
+            df['cn_turnover_series'] = (1.58 * mkt_vol_ratio).round(2)
 
     return df, status_report
-
+    
 def calculate_dual_scores(df, fms_val, cn_turnover_input, cn_bond):
     if df.empty:
         return df, 50.0, 1.55, {}
