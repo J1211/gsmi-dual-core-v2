@@ -6,6 +6,7 @@ import plotly.graph_objects as go
 from datetime import datetime, timedelta, timezone
 from fredapi import Fred
 import akshare as ak
+import requests
 
 # ==============================================================================
 # 1. 界面配置与视觉主题
@@ -36,7 +37,7 @@ st.sidebar.header("🛠️ 本土与全球双核参数")
 cn_turnover_manual = st.sidebar.number_input(
     "🌊 A股两市成交额 (万亿¥, 0为全自动U型折算)", 
     min_value=0.0, max_value=5.0, value=0.0, step=0.05,
-    help="保持 0.00 即可！系统已植入 A股 U型日内量能分布曲线，会自动按全市场指数能量精准推算当日全天预计成交额。"
+    help="保持 0.00 即可！系统已直连腾讯/新浪财经极简接口，并结合 A股 U型日内量能曲线精准折算当日预计总成交额。"
 )
 cn_10y_bond = st.sidebar.number_input(
     "🏛️ 中国 10Y 国债收益率 (%)", 
@@ -62,7 +63,7 @@ if not fred_key:
 fred = Fred(api_key=fred_key)
 
 # ==============================================================================
-# 3. 核心物理函数：U型量能折算、3日冷却记忆锁与三重装甲引擎
+# 3. 核心物理函数：腾讯/新浪直连、U型量能折算、3日冷却锁与三重装甲引擎
 # ==============================================================================
 LEADER_MAP = {
     "159566.SZ": ("300274.SZ", "阳光电源"),
@@ -118,7 +119,6 @@ def get_intraday_multiplier(last_bar_date_obj, is_cn_market=True):
             else:
                 elapsed = 120.0 + (cur_mins - lunch_end)
 
-            # A股日内累计成交占比 U型曲线基准节点 (已开盘分钟 -> 占全天总成交比例)
             u_mins =   [0.0,  15.0, 30.0, 60.0, 90.0, 120.0, 150.0, 180.0, 210.0, 240.0]
             u_shares = [0.01, 0.17, 0.28, 0.42, 0.51, 0.60,  0.70,  0.78,  0.88,  1.00]
 
@@ -126,6 +126,48 @@ def get_intraday_multiplier(last_bar_date_obj, is_cn_market=True):
             cum_share = float(np.interp(eff_elapsed, u_mins, u_shares))
             return 1.0 / cum_share, True
     return 1.0, False
+
+def get_cn_turnover_tx_sina():
+    """
+    非东财替代方案：通过腾讯财经(首选)与新浪财经(备用)极简文本接口，
+    直接获取上证综指(sh000001)+深证成指(sz399001)的实时精确人民币成交额(万亿元)。
+    """
+    # 通道 1: 腾讯财经 qt.gtimg.cn
+    try:
+        r = requests.get("https://qt.gtimg.cn/q=sh000001,sz399001", timeout=5)
+        if r.status_code == 200 and "v_sh000001=" in r.text and "v_sz399001=" in r.text:
+            total_wan = 0.0
+            for line in r.text.strip().split(";"):
+                if '="' in line:
+                    content = line.split('="')[1].rstrip('"\r\n ')
+                    parts = content.split("~")
+                    if len(parts) > 37:
+                        total_wan += float(parts[37])
+            amt_trillion = total_wan / 1e8  # 万元 -> 万亿元
+            if amt_trillion > 0.15:
+                return amt_trillion, "TX"
+    except Exception:
+        pass
+
+    # 通道 2: 新浪财经 hq.sinajs.cn (带 Referer 防403)
+    try:
+        headers = {"Referer": "https://finance.sina.com.cn"}
+        r = requests.get("https://hq.sinajs.cn/list=s_sh000001,s_sz399001", headers=headers, timeout=5)
+        if r.status_code == 200 and "hq_str_s_sh000001=" in r.text:
+            total_wan = 0.0
+            for line in r.text.strip().split(";"):
+                if '="' in line:
+                    content = line.split('="')[1].rstrip('"\r\n ')
+                    parts = content.split(",")
+                    if len(parts) >= 6:
+                        total_wan += float(parts[5])
+            amt_trillion = total_wan / 1e8
+            if amt_trillion > 0.15:
+                return amt_trillion, "Sina"
+    except Exception:
+        pass
+
+    return None, None
 
 def calc_smart_vr(vol_series, is_cn_market=True):
     """智能量能倍率 (VR) 计算器：支持 U型盘中折算与中位数抗干扰"""
@@ -314,13 +356,12 @@ def fetch_and_sync_data():
             status_report[name] = "❌"
             return (pd.Series(dtype='float64'), pd.Series(dtype='float64')) if return_vol else pd.Series(dtype='float64')
 
-    # 🚨 核心修复：改用四大宽基 ETF (510300沪深300 + 510500中证500 + 159915创业板 + 588000科创50)，彻底消灭指数100倍单位错位Bug
+    # 四大旗舰宽基 ETF 构建历史量能中位数代理 (免疫指数 100 倍单位 Bug)
     as300_c, as300_v = safe_get_yf("510300.SS", "AS300", return_vol=True)
     chinext_c, chinext_v = safe_get_yf("159915.SZ", "ChiNext", return_vol=True)
     zz500_c, zz500_v = safe_get_yf("510500.SS", "ZZ500", return_vol=True)
     kc50_c, kc50_v = safe_get_yf("588000.SS", "KC50", return_vol=True)
 
-    # 盘中成交量 U型曲线动态时间折算
     for v_s in [as300_v, chinext_v, zz500_v, kc50_v]:
         if not v_s.empty:
             mult_v, is_ext_v = get_intraday_multiplier(v_s.index[-1], is_cn_market=True)
@@ -349,26 +390,7 @@ def fetch_and_sync_data():
         'vix': safe_get_yf("^VIX", "VIX")
     }
 
-    cn_real_amt = pd.Series(dtype='float64')
-    try:
-        sh_idx = ak.stock_zh_index_daily_em(symbol="sh000001")
-        sz_idx = ak.stock_zh_index_daily_em(symbol="sz399001")
-        if not sh_idx.empty and not sz_idx.empty:
-            sh_s = pd.Series(pd.to_numeric(sh_idx['amount'], errors='coerce').values, index=pd.to_datetime(sh_idx['date'])).astype(float)
-            sz_s = pd.Series(pd.to_numeric(sz_idx['amount'], errors='coerce').values, index=pd.to_datetime(sz_idx['date'])).astype(float)
-            cn_real_amt = ((sh_s + sz_s) / 1e12).replace(0.0, np.nan).sort_index().ffill()
-            if not cn_real_amt.empty:
-                m_idx, is_ext_idx = get_intraday_multiplier(cn_real_amt.index[-1], is_cn_market=True)
-                if is_ext_idx:
-                    cn_real_amt.iloc[-1] = float(cn_real_amt.iloc[-1]) * m_idx
-            status_report["CN_Turnover"] = "✅(Real_U)"
-    except Exception:
-        status_report["CN_Turnover"] = "✅(4ETF_U_Median)"
-
     all_series = {**data_dict, **yf_dict}
-    if not cn_real_amt.empty:
-        all_series['cn_amt_real'] = cn_real_amt
-
     df = pd.DataFrame(all_series)
     df.index = pd.to_datetime(df.index).tz_localize(None)
     df = df.sort_index()
@@ -392,7 +414,7 @@ def fetch_and_sync_data():
         if 'us10y' in df.columns and 'us2y' in df.columns:
             df['yield_curve'] = df['us10y'] - df['us2y']
 
-        # 用四大旗舰宽基 ETF 的成交额比值【中位数】来平滑拟合全市场成交额，彻底免疫单只ETF异常脉冲与指数100倍单位Bug
+        # 1. 用四大宽基 ETF 中位数生成历史连续成交额序列
         ratio_cols = []
         for p_col, v_col in [('as300', 'as300_vol'), ('chinext', 'chinext_vol'), ('zz500', 'zz500_vol'), ('kc50', 'kc50_vol')]:
             if p_col in df.columns and v_col in df.columns and df[v_col].notna().sum() > 20:
@@ -405,13 +427,21 @@ def fetch_and_sync_data():
         else:
             mkt_vol_ratio = pd.Series(1.0, index=df.index)
 
-        if 'cn_amt_real' in df.columns and df['cn_amt_real'].notna().sum() > 10:
-            df['cn_turnover_series'] = df['cn_amt_real'].ffill().fillna((1.58 * mkt_vol_ratio).round(2))
+        df['cn_turnover_series'] = (1.58 * mkt_vol_ratio).round(2)
+
+        # 2. 用腾讯/新浪极简接口实时抓取今日真实人民币成交额，过 U型折算后精准覆盖最后一行
+        live_amt, src_tag = get_cn_turnover_tx_sina()
+        if live_amt is not None:
+            bj_now = get_beijing_now()
+            mult_live, is_ext_live = get_intraday_multiplier(bj_now.date(), is_cn_market=True)
+            est_full_amt = round(live_amt * mult_live, 2) if is_ext_live else round(live_amt, 2)
+            df.iloc[-1, df.columns.get_loc('cn_turnover_series')] = est_full_amt
+            status_report["CN_Turnover"] = f"✅({src_tag}_U)" if is_ext_live else f"✅({src_tag}_Close)"
         else:
-            df['cn_turnover_series'] = (1.58 * mkt_vol_ratio).round(2)
+            status_report["CN_Turnover"] = "⚠️(4ETF_Proxy)"
 
     return df, status_report
-    
+
 def calculate_dual_scores(df, fms_val, cn_turnover_input, cn_bond):
     if df.empty:
         return df, 50.0, 1.55, {}
@@ -447,10 +477,7 @@ def calculate_dual_scores(df, fms_val, cn_turnover_input, cn_bond):
             day_to = cn_turnover_input
 
         s_vol_abs = score_linear(day_to, 1.0, 2.1, 25, reverse=False)
-        if 'sh_vol' in df.columns and pd.notna(df['sh_vol'].iloc[i]):
-            v_ratio_5d = df['sh_vol'].iloc[i-4:i+1].mean() / (df['sh_vol'].iloc[i-19:i+1].median() + 1e-9)
-        else:
-            v_ratio_5d = df['as300_vol'].iloc[i-4:i+1].mean() / (df['as300_vol'].iloc[i-19:i+1].median() + 1e-9)
+        v_ratio_5d = df['cn_turnover_series'].iloc[i-4:i+1].mean() / (df['cn_turnover_series'].iloc[i-19:i+1].median() + 1e-9)
         s_vol_mom = score_linear(v_ratio_5d, 0.7, 1.35, 10, reverse=False)
         s_cn_vol = s_vol_abs + s_vol_mom
 
@@ -595,7 +622,7 @@ try:
         with r2c4:
             vol_tag = "🔥 增量博弈" if eff_turnover >= 1.8 else ("⚖️ 存量轮动" if eff_turnover >= 1.3 else "❄️ 缩量防守")
             cny_val = latest.get('cny', 6.70)
-            mode_tag = "手动" if cn_turnover_manual > 0 else "U型折算"
+            mode_tag = "手动" if cn_turnover_manual > 0 else report.get("CN_Turnover", "U型折算").replace("✅", "").strip("()")
             st.markdown(f"<div class='card-box'><div class='card-title'>🌊 A股成交({mode_tag}) & 本土ERP</div><div class='card-val'>{eff_turnover:.2f}万亿 <span style='font-size:15px;color:#00ffcc;'>| CNY {cny_val:.4f}</span></div><div class='card-sub'>{vol_tag} | 动态股债利差: +{cn_details['erp_bps']:.0f}bps</div></div>", unsafe_allow_html=True)
 
         st.markdown("---")
@@ -692,7 +719,7 @@ try:
     with tabs[1]:
         st.subheader("🔭 行业板块 ETF 全息 X光扫描 (v2.3 U型量能与20大核心探头升级版)")
         st.markdown("""
-        **v2.3 阵容与算法升级**：① 接入 **U型日内量能曲线**，消除早盘高估；② 精简非银冗余，用 50 亿规模 **`512980.SS` 传媒** 替代高波小盘影视；③ 新增 **`159996.SZ` 家电出海**、**`159992.SZ` 纯创新药** 与美股芯片风向标 **`SOXX`**。
+        **v2.3 阵容与算法升级**：① 接入 **U型日内量能曲线**，消除早盘高估；② 精简非银冗余，用 50 亿规模 **`512980.SS` 传媒** 替代小盘影视；③ 新增 **`159996.SZ` 家电出海**、**`159992.SZ` 纯创新药** 与美股芯片风向标 **`SOXX`**。
         """)
 
         sector_map = {
@@ -852,7 +879,7 @@ try:
                                 return 'color: #FF3131; font-weight: bold;'
                             return 'color: #ccc;'
 
-                        st.dataframe(res_df.style.map(color_xray, subset=['二维资金状态', '微观量价照妖镜']), use_container_width=True, height=660)
+                        st.dataframe(res_df.style.map(color_xray, subset=['二维资金状态', '微观量价照妖镜']), use_container_width=True, height=720)
 
     # ------------------------------------------------------------------------------
     # TAB 3: 猎杀雷达与五步买卖时机状态机
