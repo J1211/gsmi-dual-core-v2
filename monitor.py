@@ -800,7 +800,9 @@ try:
                             in_cooldown = check_cooldown_lock(s_close, s_high, s_low, s_vol, is_cn_market=is_cn_tkr, lookback=3)
 
                             if rs_20d > 0.03:
-                                if abs_ret_20d <= 0:
+                                if rs_5d <= -0.03:
+                                    state = "⚠️ 高位急杀/退潮 (5日转弱)"
+                                elif abs_ret_20d <= 0:
                                     state = "🛡️ 逆势抗跌 (相对跑赢/绝对未涨)"
                                 elif rs_5d > 0.05:
                                     state = "🔥 强势吸筹 & 极速逼空"
@@ -811,6 +813,8 @@ try:
                             elif rs_20d < -0.03:
                                 if rs_5d >= 0.04:
                                     state = "🌱 深坑强反抽 (5日点火/中期修复)"
+                                elif rs_5d >= -0.015 and bias_10 > -0.025 and vr >= 1.0:
+                                    state = "🛡️ 深坑抗跌企稳 (5日止血贴10MA)"
                                 elif rs_5d < -0.05:
                                     state = "🩸 持续失血 & 恐慌抛售"
                                 else:
@@ -822,7 +826,7 @@ try:
                                     state = "⚠️ 短期砸盘 (动能向下突变)"
                                 else:
                                     state = "⚖️ 随波逐流 (纯 Beta)"
-
+                            
                             if bias_10 > 0.08 and vr > 1.5:
                                 micro_mirror = "🚨 乖离过热巨量 (防机构赎回派发)"
                             elif today_dist:
@@ -871,13 +875,14 @@ try:
                             s = str(val)
                             if "稳健吸筹" in s or "强势吸筹" in s or "真阳" in s or "水上回踩" in s:
                                 return 'color: #00ffcc; font-weight: bold;'
-                            elif "点火" in s or "强反抽" in s or "水下回踩" in s:
+                            elif "点火" in s or "强反抽" in s or "水下回踩" in s or "抗跌企稳" in s:
                                 return 'color: #FFD700; font-weight: bold;'
-                            elif "过热" in s or "砸盘" in s or "天花板" in s or "冷却期" in s or "动量衰减" in s or "逆势抗跌" in s:
+                            elif "过热" in s or "砸盘" in s or "急杀" in s or "天花板" in s or "冷却期" in s or "动量衰减" in s or "逆势抗跌" in s:
                                 return 'color: #FF8C00; font-weight: bold;'
                             elif "失血" in s or "出逃" in s:
                                 return 'color: #FF3131; font-weight: bold;'
                             return 'color: #ccc;'
+
 
                         st.dataframe(res_df.style.map(color_xray, subset=['二维资金状态', '微观量价照妖镜']), use_container_width=True, height=720)
 
